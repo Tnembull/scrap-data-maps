@@ -1,7 +1,6 @@
 import type { NextApiRequest, NextApiResponse } from 'next'
 import axios, { AxiosResponse } from 'axios'
-import fs from 'fs'
-import path from 'path'
+import { redis } from '@/lib/redis'
 
 interface BimbelPlace {
   name: string
@@ -10,39 +9,34 @@ interface BimbelPlace {
   website: string
 }
 
+interface PlaceSummary {
+  place_id: string
+}
+
 // Delay helper
 const delay = (ms: number) => new Promise((res) => setTimeout(res, ms))
 
-// ===== FILE CACHE HANDLER =====
-const getCachePath = (key: string) =>
-  path.join(process.cwd(), 'cache', `${encodeURIComponent(key)}.json`)
-
-const readFromCache = (key: string): BimbelPlace[] | null => {
-  const filePath = getCachePath(key)
-  if (fs.existsSync(filePath)) {
-    const content = fs.readFileSync(filePath, 'utf8')
-    return JSON.parse(content)
-  }
-  return null
+// Redis cache handlers
+const readFromCache = async (key: string): Promise<BimbelPlace[] | null> => {
+  const result = await redis.get<BimbelPlace[]>(key)
+  return result ?? null
 }
 
-const writeToCache = (key: string, data: BimbelPlace[]): void => {
-  const filePath = getCachePath(key)
-  fs.mkdirSync(path.dirname(filePath), { recursive: true })
-  fs.writeFileSync(filePath, JSON.stringify(data), 'utf8')
+const writeToCache = async (key: string, data: BimbelPlace[]): Promise<void> => {
+  await redis.set(key, data, { ex: 60 * 60 * 24 * 7 }) // TTL: 7 hari
 }
 
-// ===== MAIN HANDLER =====
+// API handler
 export default async function handler(req: NextApiRequest, res: NextApiResponse) {
   const keyword = req.query.keyword as string
   const apiKey = process.env.GOOGLE_API_KEY
 
-  if (!keyword) {
-    return res.status(400).json({ success: false, message: 'Keyword is required' })
+  if (!keyword || !apiKey) {
+    return res.status(400).json({ success: false, message: 'Keyword or API key missing' })
   }
 
   const cacheKey = keyword.toLowerCase().trim()
-  const cached = readFromCache(cacheKey)
+  const cached = await readFromCache(cacheKey)
   if (cached) {
     return res.status(200).json({ success: true, keyword, cached: true, total: cached.length, data: cached })
   }
@@ -53,18 +47,22 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
 
     do {
       interface TextSearchResponse {
-        status: string;
-        results: PlaceSummary[];
-        next_page_token?: string;
+        status: string
+        results: PlaceSummary[]
+        next_page_token?: string
       }
-      const response: AxiosResponse<TextSearchResponse> = await axios.get('https://maps.googleapis.com/maps/api/place/textsearch/json', {
-        params: {
-          query: keyword,
-          region: 'id',
-          key: apiKey,
-          pagetoken: nextPageToken,
-        },
-      })
+
+      const response: AxiosResponse<TextSearchResponse> = await axios.get(
+        'https://maps.googleapis.com/maps/api/place/textsearch/json',
+        {
+          params: {
+            query: keyword,
+            region: 'id',
+            key: apiKey,
+            pagetoken: nextPageToken,
+          },
+        }
+      )
 
       if (response.data.status !== 'OK' && response.data.status !== 'ZERO_RESULTS') break
 
@@ -76,29 +74,28 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
     return allResults
   }
 
-  interface PlaceSummary {
-    place_id: string;
-  }
-
   const getDetails = async (places: PlaceSummary[]): Promise<BimbelPlace[]> => {
     return Promise.all(
       places.map(async (place) => {
         interface PlaceDetailsResponse {
           result: {
-            name: string;
-            formatted_address: string;
-            international_phone_number?: string;
-            website?: string;
-          };
+            name: string
+            formatted_address: string
+            international_phone_number?: string
+            website?: string
+          }
         }
 
-        const detail: AxiosResponse<PlaceDetailsResponse> = await axios.get('https://maps.googleapis.com/maps/api/place/details/json', {
-          params: {
-            place_id: place.place_id,
-            fields: 'name,formatted_address,international_phone_number,website',
-            key: apiKey,
-          },
-        })
+        const detail: AxiosResponse<PlaceDetailsResponse> = await axios.get(
+          'https://maps.googleapis.com/maps/api/place/details/json',
+          {
+            params: {
+              place_id: place.place_id,
+              fields: 'name,formatted_address,international_phone_number,website',
+              key: apiKey,
+            },
+          }
+        )
 
         const result = detail.data.result
         return {
@@ -114,10 +111,10 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
   try {
     const places = await getPlacesByKeyword(keyword)
     const detailed = await getDetails(places)
-    writeToCache(cacheKey, detailed)
+    await writeToCache(cacheKey, detailed)
     return res.status(200).json({ success: true, keyword, total: detailed.length, data: detailed })
   } catch (err) {
-    const errorMessage = err instanceof Error ? err.message : 'Unknown error'
-    return res.status(500).json({ success: false, message: errorMessage })
+    const message = err instanceof Error ? err.message : 'Unknown error'
+    return res.status(500).json({ success: false, message })
   }
 }
