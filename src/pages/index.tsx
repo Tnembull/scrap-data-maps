@@ -66,7 +66,6 @@ export default function HomePage() {
       </form>
 
       {loading && <p>⏳ Mengambil data...</p>}
-
       {searched && !loading && data.length === 0 && <p>❌ Tidak ditemukan hasil.</p>}
 
       {data.length > 0 && (
